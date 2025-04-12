@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"name": "Decoder",
+			"path": "."
+		},
+		{
+			"name": "morse_dataset",
+			"path": "../../../Downloads/morse-decoder/morse_dataset"
+		}
+	],
+	"settings": {}
+}

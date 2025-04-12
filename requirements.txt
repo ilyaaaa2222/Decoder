@@ -1,0 +1,8 @@
+# requirements.txt
+torch
+pandas
+numpy
+python-Levenshtein
+tqdm
+librosa
+scipy 
