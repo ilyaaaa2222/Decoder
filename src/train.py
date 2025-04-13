@@ -141,23 +141,41 @@ def decode_ctc_greedy(preds, index_map, blank_idx=0):
         decoded_batch.append("".join(decoded_seq))
     return decoded_batch
 
-def calculate_cer(preds_str, targets_str):
-    """Вычисляет Character Error Rate (CER)."""
+# src/train.py
+import Levenshtein
+import logging
+
+logger = logging.getLogger(__name__)
+
+def calculate_cer(preds_str: list[str], targets_str: list[str]) -> tuple[float, int, int]:
+    
     total_dist = 0
     total_len = 0
-    if not preds_str or not targets_str or len(preds_str) != len(targets_str):
-        logger.warning(f"Несовпадение длин или пустые списки при расчете CER: preds={len(preds_str)}, targets={len(targets_str)}")
-        return 1.0, len(targets_str) if targets_str else 1, len(targets_str) if targets_str else 1
+
+    # Проверяем, что списки имеют одинаковую длину (количество примеров в батче)
+    if len(preds_str) != len(targets_str):
+        logger.warning(f"Несовпадение длин батчей при расчете CER: preds={len(preds_str)}, targets={len(targets_str)}. Возвращается CER=1.0.")
+        # Возвращаем худший случай и пытаемся угадать длину для агрегации
+        effective_len = len(targets_str) if targets_str else (len(preds_str) if preds_str else 1)
+        return 1.0, effective_len, effective_len
+
+    if not targets_str: # Проверка на пустой список
+        return 0.0, 0, 0
 
     for pred, target in zip(preds_str, targets_str):
         dist = Levenshtein.distance(pred, target)
         total_dist += dist
-        total_len += len(target)
+        total_len += len(target) # Суммируем длину эталонных строк
 
-    cer = total_dist / total_len if total_len > 0 else 0.0
-    if total_dist > total_len > 0:
-        logger.debug(f"CER > 1.0: dist={total_dist}, len={total_len}")
-        # cer = min(cer, 1.0) # Опционально ограничить CER
+    
+    if total_len == 0:
+        cer = 0.0 if total_dist == 0 else float('inf')
+    else:
+        # Стандартный расчет CER
+        cer = total_dist / total_len
+        if total_dist > total_len: # Просто для информации
+             logger.debug(f"CER > 1.0 (ошибок больше, чем символов в эталоне): dist={total_dist}, len={total_len}")
+             # Можно ограничить сверху, если нужно: cer = min(cer, 1.0)
 
     return cer, total_dist, total_len
 
@@ -300,6 +318,11 @@ def main():
     criterion = nn.CTCLoss(blank=blank_idx, reduction='mean', zero_infinity=True)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=args.patience // 2, verbose=True)
+    # src/train.py -> main()
+
+    # --- Дальше начинается основной Цикл Обучения ---
+    logger.info(f"Начало обучения на {args.epochs} эпох...")
+    
 
     # Папка для сохранения
     abs_save_dir = os.path.abspath(args.save_dir)
@@ -396,95 +419,123 @@ def main():
         logger.info(f"Эпоха {epoch} Средний Тренировочный Loss: {avg_train_loss:.4f}")
 
         # --- Валидация ---
-        model.eval()
+        # src/train.py -> main()
+
+        # --- Валидация ---
+        model.eval() # Переключаем модель в режим оценки
         total_val_loss = 0.0
         total_val_dist = 0
         total_val_len = 0
         processed_val_batches = 0
+        # Убедимся, что val_loader определен где-то выше
         val_pbar = tqdm(val_loader, desc=f"Эпоха {epoch} Валидация", leave=False, unit="батч", ncols=100)
 
-        with torch.no_grad():
-            for batch_data in val_pbar:
-                try:
-                    if not batch_data or not isinstance(batch_data, tuple) or len(batch_data) != 4:
-                         logger.warning(f"Эпоха {epoch}, Вал.батч: Пропуск некорректного батча.")
-                         continue
-                    spectrograms, labels, spec_lengths, label_lengths = batch_data
-                    if spectrograms.numel() == 0 or labels.numel() == 0:
-                         logger.warning(f"Эпоха {epoch}, Вал.батч: Пропуск пустого батча.")
+        with torch.no_grad(): # Отключаем градиенты для валидации
+            # Добавил i_val для нумерации батчей валидации
+            for i_val, batch_data in enumerate(val_pbar):
+
+                try: # Обработка ошибок для батча
+
+                    # --- Проверка формата и пустоты батча ---
+                    if not batch_data or not isinstance(batch_data, (tuple, list)) or len(batch_data) != 4:
+                         logger.warning(f"Эпоха {epoch}, Вал.батч {i_val}: Пропуск некорректного батча (тип: {type(batch_data)}).")
                          continue
 
+                    spectrograms, labels, spec_lengths, label_lengths = batch_data
+
+                    # Пропускаем только если спектрограммы пустые
+                    if spectrograms.numel() == 0:
+                         logger.warning(f"Эпоха {epoch}, Вал.батч {i_val}: Пропуск батча с пустыми спектрограммами.")
+                         continue
+                    # Метки могут быть пустыми (labels.numel() == 0), это нормально
+                    # ---------------------------------------------
+
+                    # --- Основная логика валидации ---
                     spectrograms = spectrograms.to(device, non_blocking=True)
                     labels = labels.cpu()
                     spec_lengths = spec_lengths.cpu()
                     label_lengths = label_lengths.cpu()
 
-                    outputs = model(spectrograms)
+                    # --- Forward pass с AMP ---
+                    with torch.amp.autocast(device_type=device.type, dtype=torch.float16, enabled=torch.cuda.is_available()):
+                        outputs = model(spectrograms)
 
-                    if outputs.dim() != 3 or outputs.shape[1] != spectrograms.shape[0] or outputs.shape[2] != num_classes:
-                         logger.error(f"Эпоха {epoch}, Вал.батч: Неожиданная форма выхода: {outputs.shape}. Пропуск.")
-                         continue
+                        if outputs.dim() != 3 or outputs.shape[1] != spectrograms.shape[0] or outputs.shape[2] != num_classes:
+                             logger.error(f"Эпоха {epoch}, Вал.батч {i_val}: Неожиданная форма выхода: {outputs.shape}. Пропуск.")
+                             continue
 
-                    log_probs = F.log_softmax(outputs, dim=2)
-                    output_lengths = model.get_output_lengths(spec_lengths).cpu()
+                        log_probs = F.log_softmax(outputs, dim=2)
+                        output_lengths = model.get_output_lengths(spec_lengths).cpu()
 
-                    # Расчет лосса (опционально, но полезно)
-                    current_loss = float('nan') # Значение по умолчанию
-                    if torch.any(output_lengths <= 0):
-                        logger.warning(f"Эпоха {epoch}, Вал.батч: Нулевые/отрицательные output_lengths: {output_lengths}. Пропуск лосса.")
-                    elif not torch.all(output_lengths >= label_lengths):
-                         logger.warning(f"Эпоха {epoch}, Вал.батч: Нарушение CTC (T >= L). Пропуск лосса.")
-                    else:
-                         try:
-                            loss = criterion(log_probs, labels, output_lengths, label_lengths)
-                            if not (torch.isnan(loss) or torch.isinf(loss)):
-                                current_loss = loss.item()
-                                total_val_loss += current_loss
-                            else: logger.warning(f"Эпоха {epoch}, Вал.батч: NaN/Inf лосс.")
-                         except RuntimeError as e_loss:
-                              logger.error(f"Эпоха {epoch}, Вал.батч: RuntimeError CTCLoss: {e_loss}")
-                         except Exception as e_loss_other:
-                              logger.error(f"Эпоха {epoch}, Вал.батч: Ошибка CTCLoss: {e_loss_other}", exc_info=True)
+                        # --- Расчет лосса (если возможно и нужно) ---
+                        current_loss = float('nan') # Инициализация
+                        if labels.numel() > 0: # Считаем лосс только если есть метки
+                           if torch.any(output_lengths <= 0):
+                               logger.warning(f"Эпоха {epoch}, Вал.батч {i_val}: Нулевые/отрицательные output_lengths. Пропуск лосса.")
+                           elif not torch.all(output_lengths >= label_lengths):
+                                logger.warning(f"Эпоха {epoch}, Вал.батч {i_val}: Нарушение CTC (T >= L). Пропуск лосса.")
+                           else:
+                                try:
+                                    loss = criterion(log_probs, labels, output_lengths, label_lengths)
+                                    if not (torch.isnan(loss) or torch.isinf(loss)):
+                                        current_loss = loss.item()
+                                        total_val_loss += current_loss # Суммируем только валидные значения
+                                    else: logger.warning(f"Эпоха {epoch}, Вал.батч {i_val}: NaN/Inf лосс.")
+                                except RuntimeError as e_loss:
+                                      logger.error(f"Эпоха {epoch}, Вал.батч {i_val}: RuntimeError CTCLoss: {e_loss}")
+                                except Exception as e_loss_other:
+                                      logger.error(f"Эпоха {epoch}, Вал.батч {i_val}: Ошибка CTCLoss: {e_loss_other}", exc_info=True)
+                        # Если labels.numel() == 0, лосс не считаем
+                    # --- Конец autocast ---
 
-                    # Декодирование для CER
+                    # --- Декодирование и CER ---
                     preds_str, targets_str = [], []
                     try:
-                        preds_argmax = log_probs.argmax(dim=2).permute(1, 0) # [Batch, Time]
+                        preds_argmax = log_probs.argmax(dim=2).permute(1, 0)
                         preds_str = decode_ctc_greedy(preds_argmax, index_map, blank_idx)
                     except Exception as e_dec_pred:
-                         logger.error(f"Эпоха {epoch}, Вал.батч: Ошибка декодирования preds: {e_dec_pred}", exc_info=True)
+                         logger.error(f"Эпоха {epoch}, Вал.батч {i_val}: Ошибка декодирования preds: {e_dec_pred}", exc_info=True)
 
                     try:
-                        for i in range(labels.size(0)):
-                            length = label_lengths[i].item()
-                            target_indices = labels[i, :length].tolist()
+                        for label_idx in range(labels.size(0)):
+                            length = label_lengths[label_idx].item()
+                            target_indices = labels[label_idx, :length].tolist()
                             targets_str.append("".join([index_map.get(idx, '?') for idx in target_indices]))
                     except Exception as e_dec_tgt:
-                         logger.error(f"Эпоха {epoch}, Вал.батч: Ошибка декодирования targets: {e_dec_tgt}", exc_info=True)
+                         logger.error(f"Эпоха {epoch}, Вал.батч {i_val}: Ошибка декодирования targets: {e_dec_tgt}", exc_info=True)
 
-                    # Расчет CER
-                    if preds_str and targets_str and len(preds_str) == len(targets_str):
-                         _, batch_dist, batch_len = calculate_cer(preds_str, targets_str)
+                    if len(preds_str) == len(targets_str): # Убедимся, что оба декодирования вернули списки нужной длины
+                         _, batch_dist, batch_len = calculate_cer(preds_str, targets_str) # Используем исправленную calculate_cer
                          total_val_dist += batch_dist
-                         total_val_len += batch_len
+                         total_val_len += batch_len # total_val_len может остаться 0, если все метки пустые
                     else:
-                         logger.warning("Пропуск расчета CER для батча из-за ошибок декодирования.")
+                         logger.warning(f"Эпоха {epoch}, Вал.батч {i_val}: Пропуск расчета CER из-за несовпадения размеров preds/targets после декодирования.")
 
+                    # --- Обновление статистики ---
                     processed_val_batches += 1
                     current_avg_loss = total_val_loss / processed_val_batches if processed_val_batches > 0 else 0.0
-                    current_cer = total_val_dist / total_val_len if total_val_len > 0 else float('inf')
+                    # Используем агрегированные значения для CER в tqdm
+                    current_cer = total_val_dist / total_val_len if total_val_len > 0 else (0.0 if total_val_dist == 0 else float('inf'))
                     val_pbar.set_postfix(loss=f"{current_avg_loss:.4f}", cer=f"{current_cer:.4f}")
 
                 except Exception as e:
-                    logger.error(f"Эпоха {epoch}, Вал.батч: Непредвиденная ошибка: {e}", exc_info=True)
+                    logger.error(f"Эпоха {epoch}, Вал.батч {i_val}: Непредвиденная ошибка обработки батча: {e}", exc_info=True)
                     continue # Пропускаем батч
 
+            # --- Конец цикла по валидационным батчам ---
         val_pbar.close()
 
+        # --- Расчет и логирование средних метрик за эпоху ---
         avg_val_loss = total_val_loss / processed_val_batches if processed_val_batches > 0 else float('inf')
-        val_cer = total_val_dist / total_val_len if total_val_len > 0 else float('inf')
+        # Расчет финального CER за эпоху
+        if total_val_len == 0:
+             val_cer = 0.0 if total_val_dist == 0 else float('inf')
+        else:
+             val_cer = total_val_dist / total_val_len
 
-        if processed_val_batches < len(val_loader):
+        if processed_val_batches == 0:
+             logger.error(f"Эпоха {epoch}: Не было успешно обработано НИ ОДНОГО валидационного батча!")
+        elif processed_val_batches < len(val_loader):
             logger.warning(f"Эпоха {epoch}: Успешно обработано {processed_val_batches}/{len(val_loader)} валидационных батчей.")
 
         logger.info(f"Эпоха {epoch} Средний Валидационный Loss: {avg_val_loss:.4f}")
