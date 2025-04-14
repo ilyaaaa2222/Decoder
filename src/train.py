@@ -38,18 +38,19 @@ except ImportError as e:
      exit(1)
 
 # --- Настройка Логгера ---
-log_level = logging.INFO
+log_level = logging.DEBUG
 logging.basicConfig(level=log_level,
                     format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
                     datefmt='%Y-%m-%d %H:%M:%S')
 logger = logging.getLogger(__name__) # Используем __name__, чтобы логгер назывался src.train
+
 
 # --- Конфигурация и Аргументы ---
 def parse_args():
     parser = argparse.ArgumentParser(description="Train CRNN for Morse Code Recognition (Online Processing)")
 
     # --- Пути (относительно папки src, т.к. там лежит скрипт) ---
-    parser.add_argument('--train-csv', type=str, default='data/raw/train.csv',
+    parser.add_argument('--train-csv', type=str, default='data/processed/train_processed.csv',
                         help='Путь к CSV файлу для обучения (относительно папки src)')
     parser.add_argument('--val-csv', type=str, default='data/processed/val_processed.csv',
                         help='Путь к CSV файлу для валидации (относительно папки src)')
@@ -110,6 +111,17 @@ def parse_args():
     # --- Другое ---
     parser.add_argument('--seed', type=int, default=42, help='Случайное зерно для воспроизводимости')
     parser.add_argument('--log-interval', type=int, default=100, help='Интервал логирования шагов внутри эпохи')
+    
+    # --- АРГУМЕНТЫ ДЛЯ ОТЛАДКИ ---
+    parser.add_argument('--debug-validation-only', action='store_true',
+                        help='Запустить только цикл валидации без обучения (для отладки)')
+    parser.add_argument('--debug-batches', type=int, default=5,
+                        help='Количество валидационных батчей для обработки в режиме debug-validation-only')
+    parser.add_argument('--debug-verbose', action='store_true',
+                        help='Включить очень подробный вывод для каждого шага батча в режиме отладки')
+    
+    parser.add_argument('--resume-fromm', type=str, default=None,
+      help='Путь к файлу чекпоинта (.pth) для возобновления обучения (например, models/crnn_morse_online/last_model.pth)')
 
     return parser.parse_args()
 
@@ -137,7 +149,7 @@ def decode_ctc_greedy(preds, index_map, blank_idx=0):
     preds_cpu = preds.cpu() # Убедимся, что на CPU
     for seq in preds_cpu: # preds ожидается формы [Batch, Time]
         collapsed_seq = torch.unique_consecutive(seq)
-        decoded_seq = [index_map.get(str(idx.item()), '?') for idx in collapsed_seq if idx.item() != blank_idx] # Преобразуем ключ в str для index_map
+        decoded_seq = [index_map.get(idx.item(),'?') for idx in collapsed_seq if idx.item() != blank_idx] # Преобразуем ключ в str для index_map
         decoded_batch.append("".join(decoded_seq))
     return decoded_batch
 
@@ -225,7 +237,7 @@ def main():
     }
     logger.info(f"Конфигурация спектрограмм: {spec_cfg}")
     aug_cfg = None
-    if args.use_augmentations:
+    if args.use_augmentations :
         try: mask_val = float(args.mask_value)
         except ValueError: mask_val = 'mean' if args.mask_value.lower() == 'mean' else 'mean'
         aug_cfg = {
@@ -318,8 +330,7 @@ def main():
     criterion = nn.CTCLoss(blank=blank_idx, reduction='mean', zero_infinity=True)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=args.patience // 2, verbose=True)
-    # src/train.py -> main()
-
+    
     # --- Дальше начинается основной Цикл Обучения ---
     logger.info(f"Начало обучения на {args.epochs} эпох...")
     
@@ -334,7 +345,100 @@ def main():
     epochs_no_improve = 0
     start_epoch = 1
 
-    # TODO: Загрузка чекпоинта для возобновления
+    if args.resume_fromm:
+      checkpoint_path = os.path.abspath(args.resume_fromm)
+      if os.path.isfile(checkpoint_path):
+        logger.info(f"Загрузка чекпоинта для возобновления: {checkpoint_path}")
+        try:
+          # Загружаем чекпоинт на то устройство, где будем обучать
+          checkpoint = torch.load(checkpoint_path, map_location=device)
+
+          # --- Проверка совместимости конфигурации (ВАЖНО!) ---
+          # Пытаемся получить конфиг из чекпоинта, если его нет - пустой словарь
+          saved_config = checkpoint.get('config', {})
+          # Формируем текущий конфиг на основе аргументов запуска
+          current_config = {
+              'n_mels': args.n_mels,
+              'num_classes': num_classes, # num_classes берем из загруженных карт, он должен совпадать
+              'rnn_hidden_size': args.rnn_hidden,
+              'rnn_layers': args.rnn_layers,
+              'dropout': args.dropout
+          }
+          # Сравниваем конфиги
+          if saved_config and saved_config != current_config: # Проверяем только если saved_config не пустой
+              logger.warning("!!! ВНИМАНИЕ: Конфигурация модели в чекпоинте отличается от текущих аргументов!")
+              logger.warning(f"  Сохранено в чекпоинте: {saved_config}")
+              logger.warning(f"  Текущие аргументы    : {current_config}")
+              user_input = input("Конфигурации не совпадают. Продолжить загрузку? (y/n): ").lower()
+              if user_input != 'y':
+                  logger.error("Загрузка отменена пользователем из-за несовпадения конфигураций.")
+                  exit(1) # Выход из программы
+              logger.warning("Продолжение загрузки с несовпадающей конфигурацией...")
+          elif not saved_config:
+              logger.warning("Конфигурация модели не найдена в чекпоинте. Проверка пропущена.")
+
+
+          # --- Загрузка состояний ---
+          model.load_state_dict(checkpoint['model_state_dict'])
+          logger.info("Успешно загружены веса модели из чекпоинта.")
+
+            # Загрузка оптимизатора
+          if 'optimizer_state_dict' in checkpoint:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            logger.info("Успешно загружено состояние оптимизатора.")
+          else:
+            logger.warning("Состояние оптимизатора не найдено в чекпоинте. Оптимизатор начнет работу с параметрами по умолчанию.")
+
+          # Загрузка планировщика
+          if 'scheduler_state_dict' in checkpoint:
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            logger.info("Успешно загружено состояние планировщика LR.")
+          else:
+            logger.warning("Состояние планировщика LR не найдено в чекпоинте. Планировщик начнет работу с нуля.")
+
+          # Восстановление номера эпохи и лучшего CER
+          if 'epoch' in checkpoint:
+            # Важно: мы загрузили состояние *после* завершения эпохи X,
+            # поэтому начинать надо со следующей эпохи (X + 1)
+            start_epoch = checkpoint['epoch'] + 1
+            logger.info(f"Обучение будет возобновлено с эпохи: {start_epoch}")
+          else:
+            logger.warning("Номер последней завершенной эпохи не найден в чекпоинте. Обучение начнется с эпохи 1.")
+            start_epoch = 1 # Сбрасываем на всякий случай
+
+          if 'best_val_cer' in checkpoint:
+            best_val_cer = checkpoint['best_val_cer']
+            logger.info(f"Загружен лучший достигнутый CER: {best_val_cer:.4f}")
+          else:
+            logger.warning("Значение лучшего CER не найдено в чекпоинте. Будет использоваться начальное значение (inf).")
+            best_val_cer = float('inf') # Сбрасываем на всякий случай
+
+          # Опционально: можно добавить восстановление счетчика epochs_no_improve, если ты его сохранял
+
+        except FileNotFoundError:
+          logger.error(f"Ошибка: Файл чекпоинта НЕ НАЙДЕН по указанному пути: {checkpoint_path}")
+          logger.warning("Обучение начнется с нуля.")
+          start_epoch = 1
+          best_val_cer = float('inf')
+        except KeyError as e:
+          logger.error(f"Ошибка: Отсутствует необходимый ключ '{e}' в чекпоинте {checkpoint_path}.")
+          logger.warning("Не удалось загрузить чекпоинт полностью. Обучение начнется с нуля.")
+          start_epoch = 1
+          best_val_cer = float('inf')
+        except Exception as e:
+          logger.error(f"Неожиданная ошибка при загрузке чекпоинта {checkpoint_path}: {e}", exc_info=True)
+          logger.warning("Не удалось загрузить чекпоинт. Обучение начнется с нуля.")
+          start_epoch = 1
+          best_val_cer = float('inf')
+      else:
+          # Этот else относится к if os.path.isfile(checkpoint_path)
+          logger.warning(f"Указанный файл чекпоинта не найден: {checkpoint_path}. Обучение начнется с нуля.")
+          # Переменные start_epoch и best_val_cer уже имеют значения по умолчанию
+    else:
+      # Этот else относится к if args.resume_from
+      logger.info("Флаг --resume-from не указан. Обучение начнется с нуля.")
+    # Переменные start_epoch и best_val_cer уже имеют значения по умолчанию
+# --->>> КОНЕЦ БЛОКА ЗАГРУЗКИ ЧЕКПОИНТА <<<---
 
     # --- Цикл Обучения ---
     logger.info(f"Начало обучения на {args.epochs} эпох...")
@@ -344,7 +448,6 @@ def main():
         logger.info(f"--- Эпоха {epoch}/{args.epochs} ---")
         epoch_start_time = time.time()
 
-        # --- Тренировка ---
         model.train()
         total_train_loss = 0.0
         processed_batches = 0
@@ -352,7 +455,7 @@ def main():
 
         for i, batch_data in enumerate(train_pbar):
             try:
-                if not batch_data or not isinstance(batch_data, tuple) or len(batch_data) != 4:
+                if not batch_data or not isinstance(batch_data, (tuple, list)) or len(batch_data) != 4:
                      logger.warning(f"Эпоха {epoch}, Тр.батч {i}: Пропуск некорректного батча.")
                      continue
                 spectrograms, labels, spec_lengths, label_lengths = batch_data
@@ -374,6 +477,7 @@ def main():
 
                 log_probs = F.log_softmax(outputs, dim=2)
                 output_lengths = model.get_output_lengths(spec_lengths).cpu()
+                log_probs_for_loss = log_probs.cpu()
 
                 if torch.any(output_lengths <= 0):
                     logger.warning(f"Эпоха {epoch}, Тр.батч {i}: Нулевые/отрицательные output_lengths: {output_lengths}. Пропуск.")
@@ -386,8 +490,9 @@ def main():
                      logger.warning(f"Эпоха {epoch}, Тр.батч {i}: Нарушение CTC (T >= L) для {len(problem_outputs)} сэмплов. Пропуск.")
                      logger.debug(f"   Проблемные (out_len, lbl_len): {list(zip(problem_outputs, problem_labels))}")
                      continue
-
-                loss = criterion(log_probs, labels, output_lengths, label_lengths)
+  
+                loss = criterion(log_probs_for_loss, labels.cpu(), output_lengths.cpu(), label_lengths.cpu())
+                
 
                 if torch.isnan(loss) or torch.isinf(loss):
                     logger.warning(f"Эпоха {epoch}, Тр.батч {i}: Обнаружен NaN/Inf лосс ({loss.item()}). Пропуск backward/step.")
@@ -427,11 +532,12 @@ def main():
         total_val_dist = 0
         total_val_len = 0
         processed_val_batches = 0
+        batches_with_loss = 0
         # Убедимся, что val_loader определен где-то выше
         val_pbar = tqdm(val_loader, desc=f"Эпоха {epoch} Валидация", leave=False, unit="батч", ncols=100)
 
         with torch.no_grad(): # Отключаем градиенты для валидации
-            # Добавил i_val для нумерации батчей валидации
+            
             for i_val, batch_data in enumerate(val_pbar):
 
                 try: # Обработка ошибок для батча
@@ -466,6 +572,133 @@ def main():
 
                         log_probs = F.log_softmax(outputs, dim=2)
                         output_lengths = model.get_output_lengths(spec_lengths).cpu()
+                # -----------------------------------------
+                                                                                   
+                        # # --- НАЧАЛО ОТЛАДОЧНОГО БЛОКА ---
+                        # if args.debug_verbose and i_val < args.debug_batches:
+                        #     logger.info(f"--- DEBUG BATCH {i_val} (Epoch {epoch}) ---")
+                        #     try:
+                        #         # Сколько примеров из батча подробно логировать
+                        #         num_examples_to_log = min(3, spectrograms.size(0)) 
+        
+                        #         logger.info(f"Device: {device}")
+                        #         # Проверяем размерности входных данных
+                        #         logger.info(f"Spectrograms shape: {spectrograms.shape}") # Ожидаем (N, Freq, Time) или (N, 1, Freq, Time)? Зависит от модели
+                        #         logger.info(f"Labels shape: {labels.shape if labels is not None and labels.numel() > 0 else 'No Labels'}") # (N, MaxLabelLen)
+                        #         logger.info(f"Spec lengths (first {num_examples_to_log}): {spec_lengths[:num_examples_to_log].tolist()}")
+                        #         logger.info(f"Label lengths (first {num_examples_to_log}): {label_lengths[:num_examples_to_log].tolist() if label_lengths is not None else 'N/A'}")
+
+                        #         # Проверяем выход модели и длины для CTC
+                        #         logger.info(f"Raw Model Output shape: {outputs.shape}") # КРИТИЧНО: (T, N, C) или (N, T, C)?
+                        #         logger.info(f"Log Probs shape: {log_probs.shape}") # Должно совпадать с Raw Output
+                        #         logger.info(f"Output lengths (first {num_examples_to_log}): {output_lengths[:num_examples_to_log].tolist()}")
+                        #         logger.info(f"Blank index ('{blank_token_char}'): {blank_idx}")
+                        #         logger.info(f"Index Map sample (first 10): {dict(list(index_map.items())[:10])}") 
+
+                        #         # --- Проверка условия CTC T >= L ---
+                        #         if labels.numel() > 0 and label_lengths is not None:
+                        #             logger.info("--- CTC T >= L Check ---")
+                        #             for k in range(num_examples_to_log):
+                        #                 out_len = output_lengths[k].item()
+                        #                 lbl_len = label_lengths[k].item()
+                        #                 logger.info(f"  Example {k}: Output Len = {out_len}, Label Len = {lbl_len} -> {'OK' if out_len >= lbl_len else '!!! FAILED CTC T>=L !!!'}")
+                        #         else:
+                        #             logger.info("--- CTC T >= L Check: SKIPPED (No labels or label_lengths) ---")
+
+                        #         # --- Декодирование Предсказаний ---
+                        #         # ВАЖНО: Убедитесь, что argmax и permute соответствуют форме log_probs!
+                        #         # Этот код предполагает, что log_probs имеет форму (T, N, C)
+                        #         preds_str_debug = ["<DECODE_ERROR>"] * spectrograms.size(0) # Инициализация на случай ошибки
+                        #         preds_argmax_debug = None
+                        #         try:
+                        #             preds_argmax_debug = log_probs.argmax(dim=2) # Shape (T, N)
+                        #             # Переводим в (N, T) для decode_ctc_greedy и для удобства просмотра по примерам
+                        #             preds_argmax_permuted_debug = preds_argmax_debug.permute(1, 0) # Shape (N, T)
+                        #             # Убедимся, что на CPU для декодера
+                        #             preds_str_debug = decode_ctc_greedy(preds_argmax_permuted_debug.cpu(), index_map, blank_idx)
+                        #             logger.info(f"Prediction decoding successful for {len(preds_str_debug)} examples.")
+                        #         except Exception as e_dec_pred:
+                        #             logger.error(f"  ERROR decoding predictions: {e_dec_pred}", exc_info=True)
+        
+                        #         # --- Декодирование Эталонов ---
+                        #         targets_str_debug = ["<DECODE_ERROR>"] * spectrograms.size(0)
+                        #         if labels.numel() > 0 and label_lengths is not None:
+                        #             try:
+                        #                 targets_str_debug = []
+                        #                 for k in range(labels.size(0)): # Декодируем все эталоны в батче
+                        #                     length = label_lengths[k].item()
+                        #                     if length > 0:
+                        #                         target_indices = labels[k, :length].tolist()
+                        #                         targets_str_debug.append("".join([index_map.get(idx, '?') for idx in target_indices]))
+                        #                     else:
+                        #                         targets_str_debug.append("") # Пустая метка
+                        #                 logger.info(f"Target decoding successful for {len(targets_str_debug)} examples.")
+                        #             except Exception as e_dec_tgt:
+                        #                 logger.error(f"  ERROR decoding targets: {e_dec_tgt}", exc_info=True)
+                        #                 # Оставляем targets_str_debug как список "<DECODE_ERROR>" той же длины
+                        #         else:
+                        #             logger.info("Target decoding: SKIPPED (No labels or label_lengths). Assuming empty targets.")
+                        #             targets_str_debug = [""] * spectrograms.size(0) # Создаем список пустых строк
+
+                        #         # --- Сравнение Примеров ---
+                        #         logger.info("--- Example Comparison (First {} Examples) ---".format(num_examples_to_log))
+                        #         for k in range(num_examples_to_log):
+                        #             logger.info(f"  --- Example {k} ---")
+                        #             # Эталон
+                        #             if labels.numel() > 0 and label_lengths is not None:
+                        #                 lbl_len = label_lengths[k].item()
+                        #                 raw_label = labels[k, :lbl_len].tolist() if lbl_len > 0 else []
+                        #                 logger.info(f"    Target indices (len={lbl_len}): {raw_label}")
+                        #             else:
+                        #                  logger.info(f"    Target indices: N/A")
+                        #             logger.info(f"    Target string : '{targets_str_debug[k]}'")
+            
+                        #             # Предсказание
+                        #             try:
+                        #                 if preds_argmax_debug is not None:
+                        #                      # Показываем сырые индексы argmax (первые 50 шагов) для данного примера
+                        #                      # preds_argmax_debug имеет форму (T, N), берем столбец k
+                        #                      raw_pred_indices = preds_argmax_debug[:, k].cpu().tolist() 
+                        #                      logger.info(f"    Pred indices (raw argmax, T={len(raw_pred_indices)}): {raw_pred_indices[:50]}{'...' if len(raw_pred_indices) > 50 else ''}")
+                     
+                        #                      # Показываем индексы после коллапса и удаления blank
+                        #                      # Используем preds_argmax_permuted_debug (N, T), берем строку k
+                        #                      collapsed_indices = [idx.item() for idx in torch.unique_consecutive(preds_argmax_permuted_debug[k]) if idx.item() != blank_idx]
+                        #                      logger.info(f"    Pred indices (collapsed, no blank): {collapsed_indices}")
+                        #                 else:
+                        #                     logger.info("    Pred indices: <Argmax Error>")
+                        #             except Exception as e_idx_log:
+                        #                  logger.error(f"    Error logging predicted indices: {e_idx_log}")
+                        #                  logger.info("    Pred indices: <Logging Error>")
+
+                        #             logger.info(f"    Pred string   : '{preds_str_debug[k]}'")
+            
+                        #             # Расстояние Левенштейна для этого примера
+                        #             try:
+                        #                  dist = Levenshtein.distance(preds_str_debug[k], targets_str_debug[k])
+                        #                  logger.info(f"    Levenshtein Dist: {dist}")
+                        #             except Exception as e_lev:
+                        #                  logger.error(f"    Error calculating Levenshtein distance: {e_lev}")
+                        #                  logger.info(f"    Levenshtein Dist: <Calc Error>")
+
+
+                        #         # --- Расчет и Логирование CER для всего текущего батча ---
+                        #         logger.info("--- Batch CER Calculation (using debug decoded strings) ---")
+                        #         if len(preds_str_debug) == len(targets_str_debug):
+                        #             # Используем строки, полученные в этом отладочном блоке
+                        #             batch_cer_debug, batch_dist_debug, batch_len_debug = calculate_cer(preds_str_debug, targets_str_debug)
+                        #             logger.info(f"  Batch Dist Sum: {batch_dist_debug}")
+                        #             logger.info(f"  Batch Len Sum : {batch_len_debug}")
+                        #             logger.info(f"  Batch CER     : {batch_cer_debug:.4f}")
+                        #         else:
+                        #             logger.info(f"  SKIPPED due to mismatch in decoded list lengths (preds: {len(preds_str_debug)}, targets: {len(targets_str_debug)})")
+
+                        #     except Exception as e_debug:
+                        #         # Ловим ошибки внутри самого отладочного блока
+                        #         logger.error(f"  !!! ERROR within DEBUG BLOCK itself: {e_debug}", exc_info=True)
+
+                        #     logger.info(f"--- END DEBUG BATCH {i_val} ---")
+                        # # --- КОНЕЦ ОТЛАДОЧНОГО БЛОКА ---
 
                         # --- Расчет лосса (если возможно и нужно) ---
                         current_loss = float('nan') # Инициализация
@@ -476,10 +709,12 @@ def main():
                                 logger.warning(f"Эпоха {epoch}, Вал.батч {i_val}: Нарушение CTC (T >= L). Пропуск лосса.")
                            else:
                                 try:
-                                    loss = criterion(log_probs, labels, output_lengths, label_lengths)
+                                    log_probs_for_loss = log_probs.cpu()
+                                    loss = criterion(log_probs_for_loss, labels.cpu(), output_lengths.cpu(), label_lengths.cpu())
                                     if not (torch.isnan(loss) or torch.isinf(loss)):
                                         current_loss = loss.item()
-                                        total_val_loss += current_loss # Суммируем только валидные значения
+                                        total_val_loss += current_loss 
+                                        batches_with_loss += 1
                                     else: logger.warning(f"Эпоха {epoch}, Вал.батч {i_val}: NaN/Inf лосс.")
                                 except RuntimeError as e_loss:
                                       logger.error(f"Эпоха {epoch}, Вал.батч {i_val}: RuntimeError CTCLoss: {e_loss}")
@@ -513,10 +748,14 @@ def main():
 
                     # --- Обновление статистики ---
                     processed_val_batches += 1
-                    current_avg_loss = total_val_loss / processed_val_batches if processed_val_batches > 0 else 0.0
+                    current_avg_loss_valid = total_val_loss / batches_with_loss if batches_with_loss > 0 else 0.0
                     # Используем агрегированные значения для CER в tqdm
                     current_cer = total_val_dist / total_val_len if total_val_len > 0 else (0.0 if total_val_dist == 0 else float('inf'))
-                    val_pbar.set_postfix(loss=f"{current_avg_loss:.4f}", cer=f"{current_cer:.4f}")
+                    val_pbar.set_postfix(
+                        loss=f"{current_avg_loss_valid:.4f}", # Средний лосс по УСПЕШНЫМ батчам
+                        cer=f"{current_cer:.4f}",
+                        loss_batches=f"{batches_with_loss}/{processed_val_batches}" # Показываем N(успешных)/N(обработанных)
+                        )
 
                 except Exception as e:
                     logger.error(f"Эпоха {epoch}, Вал.батч {i_val}: Непредвиденная ошибка обработки батча: {e}", exc_info=True)
@@ -526,7 +765,7 @@ def main():
         val_pbar.close()
 
         # --- Расчет и логирование средних метрик за эпоху ---
-        avg_val_loss = total_val_loss / processed_val_batches if processed_val_batches > 0 else float('inf')
+        avg_val_loss = total_val_loss / batches_with_loss if batches_with_loss > 0 else float('inf')
         # Расчет финального CER за эпоху
         if total_val_len == 0:
              val_cer = 0.0 if total_val_dist == 0 else float('inf')
@@ -538,7 +777,7 @@ def main():
         elif processed_val_batches < len(val_loader):
             logger.warning(f"Эпоха {epoch}: Успешно обработано {processed_val_batches}/{len(val_loader)} валидационных батчей.")
 
-        logger.info(f"Эпоха {epoch} Средний Валидационный Loss: {avg_val_loss:.4f}")
+        logger.info(f"Эпоха {epoch} Средний Валидационный Loss (по {batches_with_loss} батчам): {avg_val_loss:.4f}")
         logger.info(f"Эпоха {epoch} Валидационный CER: {val_cer:.4f} (Dist: {total_val_dist}, Len: {total_val_len})")
 
         # Обновление планировщика, сохранение моделей, ранняя остановка
