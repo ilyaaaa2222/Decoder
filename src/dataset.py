@@ -131,103 +131,77 @@ class MorseDataset(Dataset):
     def __len__(self) -> int:
         """Возвращает количество сэмплов в датасете."""
         return len(self.data_frame)
-
+    
     def __getitem__(self, idx: int) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        """
-        Загружает аудиофайл, генерирует спектрограмму, применяет аугментации (если нужно),
-        кодирует метку и возвращает тензоры.
-
-        Args:
-            idx (int): Индекс сэмпла.
-
-        Returns:
-            Optional[Tuple[torch.Tensor, torch.Tensor]]: Кортеж (спектрограмма, метка) или None в случае ошибки.
-        """
         if torch.is_tensor(idx):
             idx = idx.item()
 
-        # Проверка индекса
         if not (0 <= idx < len(self.data_frame)):
             logger.warning(f"Запрошен неверный индекс {idx}, размер датасета {len(self.data_frame)}.")
             return None
 
         row = self.data_frame.iloc[idx]
         audio_filename = row.get(self.audio_filename_col)
-        full_audio_path = None # Инициализируем для логов/ошибок
+        full_audio_path = None
 
         try:
-            # Проверка имени файла из CSV
             if pd.isna(audio_filename) or not isinstance(audio_filename, str) or not audio_filename:
                  logger.debug(f"[idx={idx}] Неверное или отсутствующее имя аудиофайла в CSV: '{audio_filename}'. Пропуск.")
                  return None
 
-            # --- Построение пути к АУДИО файлу ---
-            full_audio_path = os.path.join(self.audio_dir, audio_filename)
+            # --- Построение пути к АУДИО файлу (с добавлением расширения, если нужно) ---
+            filename_to_use = audio_filename
+            if self.audio_ext and isinstance(audio_filename, str) and not audio_filename.endswith(self.audio_ext):
+                 if self.audio_ext.startswith('.'): filename_to_use = audio_filename + self.audio_ext
+                 else: filename_to_use = f"{audio_filename}.{self.audio_ext}"
+                 logger.debug(f"[idx={idx}] Добавлено расширение '{self.audio_ext}' к имени файла '{audio_filename}'")
+            full_audio_path = os.path.join(self.audio_dir, filename_to_use)
             logger.debug(f"[idx={idx}] Попытка загрузки аудио: {full_audio_path}")
 
             # --- ШАГ 1: Генерация спектрограммы ---
-            # Используем параметры из self.spectrogram_cfg
-            spectrogram = generate_mel_spectrogram(
-                audio_path=full_audio_path,
-                **self.spectrogram_cfg
-            )
-
-            # Обработка ошибки генерации (generate_mel_spectrogram вернет None)
+            spectrogram = generate_mel_spectrogram(audio_path=full_audio_path, **self.spectrogram_cfg)
             if spectrogram is None:
                 logger.warning(f"[idx={idx}] Не удалось сгенерировать спектрограмму для файла {full_audio_path}. Пропуск.")
-                # Сама функция generate_mel_spectrogram уже залогировала детали ошибки
                 return None
 
             # --- ШАГ 2: Применение аугментаций (только для обучения) ---
-            if self.is_train and self.augment_cfg:
+            if self.is_train and self.augment_cfg: # Аугментация зависит от is_train
                  logger.debug(f"[idx={idx}] Применение аугментаций...")
-                 spectrogram = apply_spectrogram_augmentations(
-                     spectrogram=spectrogram,
-                     **self.augment_cfg # Используем параметры из self.augment_cfg
-                 )
+                 spectrogram = apply_spectrogram_augmentations(spectrogram=spectrogram, **self.augment_cfg)
 
             # --- ШАГ 3: Конвертация спектрограммы в тензор ---
             spectrogram_tensor = torch.from_numpy(spectrogram).float()
-            # Ожидаемая форма: [n_mels, time_steps]
 
-            # --- ШАГ 4: Обработка меток ---
-            label_tensor = torch.empty(0, dtype=torch.long) # Пустой тензор по умолчанию (для инференса)
-            if self.is_train:
-                morse_code = row.get(self.label_col, '') # Используем .get для надежности
-                if pd.isna(morse_code) or not isinstance(morse_code, str):
-                    morse_code = "" # Обрабатываем NaN или не-строки как пустую строку
+            # --- ШАГ 4: Обработка меток (ВСЕГДА, не только для is_train) ---
+            morse_code = row.get(self.label_col, '') # Получаем метку из CSV
+            if pd.isna(morse_code) or not isinstance(morse_code, str):
+                morse_code = "" # Обрабатываем NaN/не-строки
 
-                label_indices = []
-                for char in morse_code:
-                    index = self.char_map.get(char)
-                    if index is None:
-                        # Символ не найден в словаре, можно заменить на blank или пропустить
-                        # logger.warning(f"[idx={idx}] Символ '{char}' не найден в char_map. Используется blank ({self.blank_token_index}).")
-                        label_indices.append(self.blank_token_index)
-                    else:
-                        label_indices.append(index)
+            label_indices = []
+            for char in morse_code: # Итерируем по символам метки
+                index = self.char_map.get(char)
+                if index is None:
+                    # logger.warning(f"[idx={idx}] Символ '{char}' не найден в char_map. Используется blank ({self.blank_token_index}).")
+                    label_indices.append(self.blank_token_index) # Используем blank или можно добавить обработку ошибок
+                else:
+                    label_indices.append(index)
 
-                label_tensor = torch.tensor(label_indices, dtype=torch.long)
+            # Создаем тензор из индексов
+            label_tensor = torch.tensor(label_indices, dtype=torch.long)
+
+            # Теперь label_tensor будет содержать правильные индексы (или пустой тензор, если morse_code был "")
 
             logger.debug(f"[idx={idx}] Обработка завершена. Форма спектрограммы: {spectrogram_tensor.shape}, Длина метки: {len(label_tensor)}")
             return spectrogram_tensor, label_tensor
 
         except FileNotFoundError:
-             # Эта ошибка может возникнуть, если generate_mel_spectrogram не поймает ее внутри
              logger.warning(f"[idx={idx}] Файл аудио НЕ НАЙДЕН: {full_audio_path}. Пропуск.")
              return None
         except Exception as e:
-            # Ловим любые другие неожиданные ошибки при обработке этого сэмпла
             path_repr = full_audio_path or audio_filename or 'N/A'
-            # Используем exc_info=True для вывода полного стектрейса при отладке
-            logger.error(f"Неожиданная ошибка при обработке сэмпла [idx={idx}], аудио: {path_repr}: {e}. Пропуск.", exc_info=False)
+            logger.error(f"Неожиданная ошибка при обработке сэмпла [idx={idx}], аудио: {path_repr}: {e}. Пропуск.", exc_info=False) # Убрал exc_info=True для краткости логов
             return None
-
-
-# --- Функция для сборки батча (Collate Function) ---
-# Эта функция не требует изменений, т.к. она работает с результатом __getitem__
-# и уже умеет обрабатывать None и паддить последовательности разной длины.
-# Убедись, что label_padding_value (обычно 0) соответствует твоему blank_token_index.
+  
 def collate_fn(batch: List[Optional[Tuple[torch.Tensor, torch.Tensor]]],
                padding_value: float = 0.0, # Значение для паддинга спектрограмм
                label_padding_value: int = 0  # Значение для паддинга меток (обычно индекс blank/pad)
