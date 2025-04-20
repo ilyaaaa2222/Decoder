@@ -21,7 +21,7 @@ from typing import Union, Optional # Для совместимости с Python
 # --- Импорты из проекта (ОТНОСИТЕЛЬНЫЕ, т.к. запускаем с -m) ---
 try:
     from .dataset import MorseDataset, collate_fn
-    from .model import CRNNModel
+    from .model import CRNNModelModified
 except ImportError as e:
      # Эта ошибка не должна возникать при запуске с python -m src.train из Decoder/
      # но оставим для диагностики
@@ -80,20 +80,41 @@ def parse_args():
     parser.add_argument('--fmax', type=int, default=None, help='Макс. частота для Мел-фильтров (None = sr/2)')
     parser.add_argument('--normalize-audio', action='store_true', default=True, help='Применять нормализацию аудио')
     parser.add_argument('--no-normalize-audio', action='store_false', dest='normalize_audio', help='Отключить нормализацию аудио')
-    parser.add_argument('--apply-filter', action='store_true', default=False, help='Применять ФНЧ к аудио')
-    parser.add_argument('--cutoff-freq', type=int, default=2400, help='Частота среза ФНЧ (если --apply-filter)')
+    # parser.add_argument('--apply-filter', action='store_true', default=False, help='Применять ФНЧ к аудио')
+    # parser.add_argument('--cutoff-freq', type=int, default=2400, help='Частота среза ФНЧ (если --apply-filter)')
     parser.add_argument('--filter-order', type=int, default=5, help='Порядок ФНЧ (если --apply-filter)')
 
     # --- Параметры аугментаций ---
-    parser.add_argument('--use-augmentations', action='store_true', default=True, help='Применять аугментации на трейне')
-    parser.add_argument('--no-augmentations', action='store_false', dest='use_augmentations', help='Отключить аугментации')
-    parser.add_argument('--freq-mask-prob', type=float, default=0.5, help='Вероятность частотного маскирования')
-    parser.add_argument('--time-mask-prob', type=float, default=0.5, help='Вероятность временного маскирования')
-    parser.add_argument('--freq-mask-param', type=int, default=7, help='Макс. высота частотной маски')
-    parser.add_argument('--time-mask-param', type=int, default=12, help='Макс. ширина временной маски')
-    parser.add_argument('--num-freq-masks', type=int, default=1, help='Кол-во частотных масок')
-    parser.add_argument('--num-time-masks', type=int, default=1, help='Кол-во временных масок')
-    parser.add_argument('--mask-value', type=str, default='mean', help="Значение для маскирования ('mean' или float)")
+    # parser.add_argument('--use-augmentations', action='store_true', default=True, help='Применять аугментации на трейне')
+    # parser.add_argument('--no-augmentations', action='store_false', dest='use_augmentations', help='Отключить аугментации')
+    # parser.add_argument('--freq-mask-prob', type=float, default=0.5, help='Вероятность частотного маскирования')
+    # parser.add_argument('--time-mask-prob', type=float, default=0.5, help='Вероятность временного маскирования')
+    # parser.add_argument('--freq-mask-param', type=int, default=7, help='Макс. высота частотной маски')
+    # parser.add_argument('--time-mask-param', type=int, default=12, help='Макс. ширина временной маски')
+    # parser.add_argument('--num-freq-masks', type=int, default=1, help='Кол-во частотных масок')
+    # parser.add_argument('--num-time-masks', type=int, default=1, help='Кол-во временных масок')
+    # parser.add_argument('--mask-value', type=str, default='mean', help="Значение для маскирования ('mean' или float)")
+
+    # --- Параметры ОЧИСТКИ АУДИО (Полосовая фильтрация) ---
+    parser.add_argument('--apply-filter', action='store_true', default=True, # По умолчанию ВЫКЛЮЧЕНО
+                        help='Применять полосовую фильтрацию к АУДИО сигналу перед спектрограммой')
+    parser.add_argument('--no-apply-filter', action='store_false', dest='apply_filter') # Флаг для отключения
+    parser.add_argument('--lowcut-freq', type=int, default=400,
+                        help='Нижняя частота среза для полосового фильтра (Гц)')
+    parser.add_argument('--highcut-freq', type=int, default=2200,
+                        help='Верхняя частота среза для полосового фильтра (Гц)')
+
+    # --- Параметры ОЧИСТКИ СПЕКТРОГРАММЫ (Порог в дБ, применяется только на трейне) ---
+    parser.add_argument('--use-cleaning', action='store_true', default=True, # По умолчанию ВКЛЮЧЕНО
+                        help='Применять очистку спектрограммы (пороговую обработку) ТОЛЬКО на трейне')
+    parser.add_argument('--no-cleaning', action='store_false', dest='use_cleaning',
+                        help='Отключить очистку спектрограммы на трейне')
+    # Параметры для конкретного метода очистки (пороговая обработка)
+    parser.add_argument('--clean-apply-threshold', action='store_true', default=True, # По умолчанию внутри use_cleaning порог применяется
+                        help='Применять пороговую обработку к спектрограмме (дБ) (если use_cleaning включен)')
+    parser.add_argument('--no-clean-apply-threshold', action='store_false', dest='clean_apply_threshold') # Флаг для явного отключения порога
+    parser.add_argument('--clean-db-threshold', type=float, default=-20.0,
+                        help='Порог в дБ для удаления тишины/шума в спектрограмме')
 
     # --- Гиперпараметры обучения ---
     parser.add_argument('--epochs', type=int, default=50, help='Количество эпох обучения')
@@ -230,25 +251,23 @@ def main():
     # Создание конфигураций для ОНЛАЙН обработки
     logger.info("Формирование конфигураций для обработки данных...")
     spec_cfg = {
-        'target_sr': args.sr, 'n_fft': args.n_fft, 'hop_length': args.hop_length,
-        'n_mels': args.n_mels, 'fmin': args.fmin, 'fmax': args.fmax if args.fmax is not None else args.sr // 2,
-        'normalize_audio': args.normalize_audio, 'apply_filter': args.apply_filter,
-        'cutoff_freq_filter': args.cutoff_freq, 'filter_order': args.filter_order
+        'target_sr': args.sr,
+        'n_fft': args.n_fft,
+        'hop_length': args.hop_length,
+        'n_mels': args.n_mels,
+        'fmin': args.fmin,
+        'fmax': args.fmax if args.fmax is not None else args.sr // 2,
+        'normalize_audio': args.normalize_audio,
+        'apply_bandpass_filter': args.apply_filter, # Используем флаг --apply-filter
+        'lowcut_freq': args.lowcut_freq,
+        'highcut_freq': args.highcut_freq,
+        'filter_order': args.filter_order,
+        'apply_db_threshold': args.clean_apply_threshold, # Используем --clean-apply-threshold
+        'db_threshold': args.clean_db_threshold,
+        # Используем --clean-db-threshold
     }
-    logger.info(f"Конфигурация спектрограмм: {spec_cfg}")
-    aug_cfg = None
-    if args.use_augmentations :
-        try: mask_val = float(args.mask_value)
-        except ValueError: mask_val = 'mean' if args.mask_value.lower() == 'mean' else 'mean'
-        aug_cfg = {
-            'freq_mask_prob': args.freq_mask_prob, 'time_mask_prob': args.time_mask_prob,
-            'freq_mask_param': args.freq_mask_param, 'time_mask_param': args.time_mask_param,
-            'num_freq_masks': args.num_freq_masks, 'num_time_masks': args.num_time_masks,
-            'mask_value': mask_val
-        }
-        logger.info(f"Конфигурация аугментаций: {aug_cfg}")
-    else:
-        logger.info("Аугментации отключены.")
+    logger.info(f"Полная конфигурация для generate_mel_spectrogram (включая очистку): {spec_cfg}")
+
 
     # Создание датасетов и загрузчиков
     logger.info("Создание датасетов и загрузчиков...")
@@ -261,17 +280,21 @@ def main():
             char_map=char_map,
             audio_dir=args.audio_dir, # Передаем путь как есть (относительно CWD)
             spectrogram_cfg=spec_cfg,
-            augment_cfg=aug_cfg,
+            augment_cfg=None,
             is_train=True,
             audio_filename_col=args.audio_id_col,
             label_col=args.message_col,
             audio_ext=args.audio_ext
         )
+        spec_cfg_val = spec_cfg.copy() # Копируем базовый
+        spec_cfg_val['apply_bandpass_filter'] = True # Отключаем фильтр для вал
+        spec_cfg_val['apply_db_threshold'] = True    # Отключаем порог для вал
+        logger.info(f"Конфигурация для generate_mel_spectrogram (ВАЛИДАЦИЯ): {spec_cfg_val}")
         val_dataset = MorseDataset(
             csv_path=args.val_csv,
             char_map=char_map,
             audio_dir=args.audio_dir,
-            spectrogram_cfg=spec_cfg,
+            spectrogram_cfg=spec_cfg_val,
             augment_cfg=None,
             is_train=False,
             audio_filename_col=args.audio_id_col,
@@ -308,7 +331,7 @@ def main():
     # Инициализация модели
     logger.info("Инициализация модели...")
     try:
-        model = CRNNModel(
+        model = CRNNModelModified(
             n_mels=args.n_mels,
             num_classes=num_classes,
             rnn_hidden_size=args.rnn_hidden,
