@@ -12,7 +12,6 @@ from typing import Tuple, Optional, Dict, List, Any # Добавлен Any дл�
 # Убедись, что папка Decoder/ является корневой для импорта или настроен PYTHONPATH
 try:
     from data_processing.generate_spectrograms import generate_mel_spectrogram
-    from data_processing.augmentations import apply_spectrogram_augmentations
 except ImportError as e:
      print("Ошибка импорта функций из data_processing. Убедитесь, что структура папок верна и Decoder/ доступен для импорта.")
      print(e)
@@ -159,18 +158,19 @@ class MorseDataset(Dataset):
             logger.debug(f"[idx={idx}] Попытка загрузки аудио: {full_audio_path}")
 
             # --- ШАГ 1: Генерация спектрограммы ---
-            spectrogram = generate_mel_spectrogram(audio_path=full_audio_path, **self.spectrogram_cfg)
-            if spectrogram is None:
+            spectrogram_db = generate_mel_spectrogram(audio_path=full_audio_path, **self.spectrogram_cfg)
+            if spectrogram_db is None:
                 logger.warning(f"[idx={idx}] Не удалось сгенерировать спектрограмму для файла {full_audio_path}. Пропуск.")
                 return None
 
             # --- ШАГ 2: Применение аугментаций (только для обучения) ---
-            if self.is_train and self.augment_cfg: # Аугментация зависит от is_train
-                 logger.debug(f"[idx={idx}] Применение аугментаций...")
-                 spectrogram = apply_spectrogram_augmentations(spectrogram=spectrogram, **self.augment_cfg)
+            spectrogram_processed = generate_mel_spectrogram(
+                audio_path=full_audio_path,
+                **self.spectrogram_cfg # Распаковываем ВЕСЬ словарь параметров
+            )
 
             # --- ШАГ 3: Конвертация спектрограммы в тензор ---
-            spectrogram_tensor = torch.from_numpy(spectrogram).float()
+            spectrogram_tensor = torch.from_numpy(spectrogram_processed).float()
 
             # --- ШАГ 4: Обработка меток (ВСЕГДА, не только для is_train) ---
             morse_code = row.get(self.label_col, '') # Получаем метку из CSV
